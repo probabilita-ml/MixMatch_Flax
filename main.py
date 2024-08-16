@@ -182,6 +182,20 @@ def train_step(
     return state, loss
 
 
+@jax.jit
+def forward_step(x: Array, state: TrainState) -> tuple[Array, FrozenDict]:
+    """perform the forward pass
+    """
+    logits, batch_stats = state.apply_fn(
+        variables={'params': state.params, 'batch_stats': state.batch_stats},
+        x=x,
+        train=True,
+        mutable=['batch_stats']
+    )
+
+    return logits, batch_stats
+
+
 def train(
     dataset_labelled: dx._c.Buffer,
     dataset_unlabelled: dx._c.Buffer,
@@ -312,18 +326,8 @@ def train(
         )
 
         # guess labels
-        logits_u1, _ = state.apply_fn(
-            variables={'params': state.params, 'batch_stats': state.batch_stats},
-            x=u1,
-            train=True,
-            mutable=['batch_stats']
-        )
-        logits_u2, _ = state.apply_fn(
-            variables={'params': state.params, 'batch_stats': state.batch_stats},
-            x=u2,
-            train=True,
-            mutable=['batch_stats']
-        )
+        logits_u1, _ = forward_step(x=u1, state=state)
+        logits_u2, _ = forward_step(x=u2, state=state)
 
         # average
         lu1 = jax.nn.softmax(x=logits_u1, axis=-1)
