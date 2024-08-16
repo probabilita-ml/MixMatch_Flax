@@ -1,0 +1,45 @@
+defaults:
+  - override hydra/hydra_logging: disabled  
+  - override hydra/job_logging: disabled
+  - _self_
+  
+hydra:  
+  output_subdir: null  
+  run:  
+    dir: .
+
+experiment:
+  name: MixMatch
+  tracking_uri: sqlite:///mixmatch.db
+  logdir: ./logdir
+  run_id: null
+
+dataset:
+  name: cifar100
+  root: /sda2/datasets/cifar100/ciFAIR-100
+  num_classes: 100
+  # train_labelled_file: /sda2/datasets/cifar100/ciFAIR-100/synthetic_expert/train_0_1_2_3_4_5_6_7_8_9_0.5.json
+  train_labelled_file: /sda2/datasets/cifar100/ciFAIR-100/synthetic_expert/train_10_11_12_13_14_15_16_17_18_19_0.5.json
+  train_unlabelled_file: /sda2/datasets/cifar100/ciFAIR-100/train.json
+  test_file: /sda2/datasets/cifar100/ciFAIR-100/test.json
+  resized_shape: null
+  crop_size: [32, 32]
+  mean: null
+  std: null
+
+training:
+  prob_random_h_flip: 0.5
+  sharpen_factor: 0.5
+  alpha: 0.75
+  lambda_u: 75.
+  lr: 0.01
+  batch_size: 128
+  num_epochs: 1000
+  progress_bar: True
+  num_threads: 4
+  prefetch_size: 8
+
+jax:
+  platform: cuda
+  mem: 0.95
+  disable_jit: False

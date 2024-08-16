@@ -8,6 +8,10 @@ from functools import partial
 # third-party libraries
 from tqdm import tqdm
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import flatdict
+
 import jax
 import jax.numpy as jnp
 
@@ -31,105 +35,11 @@ from utils import (
     TrainState,
     get_dataset,
     prepare_dataset,
-    initialise_huggingface_resnet,
-    list_of_ints,
-    list_of_floats
+    initialise_huggingface_resnet
 )
 
-from ResNet import resnet18
-
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Parse input arguments')
-
-    parser.add_argument('--experiment-name', type=str, default='MixMatch')
-    parser.add_argument('--dataset-name', type=str, help='Name of dataset')
-    parser.add_argument('--ds-root', type=str, help='Root folder of dataset')
-
-    parser.add_argument('--train-labelled-file', type=str, help='Path to json file of labelled training samples')
-    parser.add_argument('--train-unlabelled-file', type=str)
-    parser.add_argument('--test-file', type=str)
-
-    parser.add_argument('--num-classes', type=int, help='Number of classes')
-
-    parser.add_argument('--lr', type=float, help='Learning rate for gating model')
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
-    parser.add_argument('--num-epochs', type=int, default=100, help='Number of epochs')
-
-    parser.add_argument('--sharpen-factor', type=float, default=0.5)
-    parser.add_argument('--alpha', type=float, default=0.75)
-    parser.add_argument('--lambda-u', type=float, default=75.)
-
-    # region DATA AUGMENTATION
-    parser.add_argument(
-        '--resized-shape',
-        type=list_of_ints,
-        default=None,
-        help='Tuple of width and height, e.g., (230, 230)'
-    )
-    parser.add_argument(
-        '--crop-size',
-        type=list_of_ints,
-        default=None,
-        help='Tuple of width and height, e.g., (224, 224)'
-    )
-    parser.add_argument(
-        '--prob-random-h-flip',
-        type=float,
-        default=None,
-        help='Probability to horizontal-flip'
-    )
-    parser.add_argument(
-        '--mean',
-        type=list_of_floats,
-        default=None,
-        help='The mean for sample normalisation'
-    )
-    parser.add_argument(
-        '--std',
-        type=list_of_floats,
-        default=None,
-        help='The standard deviation for sample normalisation'
-    )
-    # endregion
-
-    parser.add_argument('--run-id', type=str, default=None, help='Run ID in MLFlow')
-
-    parser.add_argument(
-        '--jax-platform',
-        type=str,
-        default='cpu',
-        help='cpu, cuda or tpu'
-    )
-    parser.add_argument(
-        '--mem-frac',
-        type=float,
-        default=0.9,
-        help='Percentage of GPU memory allocated for Jax'
-    )
-
-    parser.add_argument('--prefetch-size', type=int, default=8)
-    parser.add_argument('--num-threads', type=int, default=2)
-
-    parser.add_argument('--progress-bar', dest='progress_bar', action='store_true')
-    parser.add_argument('--no-progress-bar', dest='progress_bar', action='store_false')
-    parser.set_defaults(progress_bar=True)
-
-    parser.add_argument('--train', dest='train', action='store_true')
-    parser.add_argument('--debug', dest='train', action='store_false')
-    parser.set_defaults(train=True)
-
-    parser.add_argument(
-        '--tracking-uri',
-        type=str,
-        default='http://127.0.0.1:5000',
-        help='MLFlow server'
-    )
-    parser.add_argument('--logdir', type=str, default='logdir', help='Path to save model')
-
-    args = parser.parse_args()
-
-    return args
+# from ResNet import resnet18
+from PreActResNet import ResNet18 as resnet18
 
 
 def interleave(xy: list[Array]):
@@ -231,7 +141,7 @@ def train_step(
 ) -> tuple[TrainState, Scalar]:
     """
     """
-    apply_batch = jax.vmap(fun=state.apply_fn, in_axes=(None, 0, None))
+    apply_batch = jax.vmap(fun=partial(state.apply_fn, mutable=['batch_stats']), in_axes=(None, 0, None))
 
     def loss_function(params: FrozenDict) -> tuple[Scalar, FrozenDict]:
         """
@@ -275,7 +185,8 @@ def train_step(
 def train(
     dataset_labelled: dx._c.Buffer,
     dataset_unlabelled: dx._c.Buffer,
-    state: TrainState
+    state: TrainState,
+    cfg: DictConfig
 ) -> tuple[TrainState, Scalar]:
     """the main training procedure
     """
@@ -283,22 +194,22 @@ def train(
     stream_labelled = prepare_dataset(
         dataset=dataset_labelled,
         shuffle=True,
-        batch_size=args.batch_size,
-        prefetch_size=args.prefetch_size,
-        num_threads=args.num_threads,
-        mean=args.mean,
-        std=args.std,
+        batch_size=cfg.training.batch_size,
+        prefetch_size=cfg.training.prefetch_size,
+        num_threads=cfg.training.num_threads,
+        mean=cfg.dataset.mean,
+        std=cfg.dataset.std,
         random_crop_size=None,
         prob_random_h_flip=None
     )
     stream_unlabelled = prepare_dataset(
         dataset=dataset_unlabelled,
         shuffle=True,
-        batch_size=args.batch_size,
-        prefetch_size=args.prefetch_size,
-        num_threads=args.num_threads,
-        mean=args.mean,
-        std=args.std,
+        batch_size=cfg.training.batch_size,
+        prefetch_size=cfg.training.prefetch_size,
+        num_threads=cfg.training.num_threads,
+        mean=cfg.dataset.mean,
+        std=cfg.dataset.std,
         random_crop_size=None,
         prob_random_h_flip=None
     )
@@ -307,35 +218,35 @@ def train(
     loss_accum = metrics.Average()
 
     fold_in_batch = jax.vmap(fun=jax.random.fold_in, in_axes=(0, 0))
-    crop_size = (*args.crop_size, 3)
+    crop_size = (*cfg.dataset.crop_size, 3)
 
     for unlabelled_samples in tqdm(
         iterable=stream_unlabelled,
         desc='train',
-        total=len(dataset_unlabelled)//args.batch_size,
+        total=len(dataset_unlabelled) // cfg.training.batch_size,
         ncols=80,
         leave=False,
         position=2,
         colour='blue',
-        disable=not args.progress_bar
+        disable=not cfg.training.progress_bar
     ):
-        if (len(unlabelled_samples['image']) < args.batch_size):
+        if (len(unlabelled_samples['image']) < cfg.training.batch_size):
             break
 
         try:
             labelled_samples = next(stream_labelled)
-            if (len(labelled_samples['image']) < args.batch_size):
+            if (len(labelled_samples['image']) < cfg.training.batch_size):
                 raise StopIteration
         except StopIteration:
             # reset the labelled data subset
             stream_labelled = prepare_dataset(
                 dataset=dataset_labelled,
                 shuffle=True,
-                batch_size=args.batch_size,
-                prefetch_size=args.prefetch_size,
-                num_threads=args.num_threads,
-                mean=args.mean,
-                std=args.std,
+                batch_size=cfg.training.batch_size,
+                prefetch_size=cfg.training.prefetch_size,
+                num_threads=cfg.training.num_threads,
+                mean=cfg.dataset.mean,
+                std=cfg.dataset.std,
                 random_crop_size=None,
                 prob_random_h_flip=None
             )
@@ -365,38 +276,38 @@ def train(
             keys2=keys01,
             images=labelled_inputs,
             crop_size=crop_size,
-            prob_random_h_flip=args.prob_random_h_flip
+            prob_random_h_flip=cfg.training.prob_random_h_flip
         )
         u1 = augment_batch_images(
             keys1=keys1,
             keys2=keys11,
             images=unlabelled_inputs,
             crop_size=crop_size,
-            prob_random_h_flip=args.prob_random_h_flip
+            prob_random_h_flip=cfg.training.prob_random_h_flip
         )
         u1 = augment_batch_images(
             keys1=keys11,
             keys2=keys1,
             images=u1,
             crop_size=crop_size,
-            prob_random_h_flip=args.prob_random_h_flip
+            prob_random_h_flip=cfg.training.prob_random_h_flip
         )
         u2 = augment_batch_images(
             keys1=keys2,
             keys2=keys21,
             images=unlabelled_inputs,
             crop_size=crop_size,
-            prob_random_h_flip=args.prob_random_h_flip
+            prob_random_h_flip=cfg.training.prob_random_h_flip
         )
         u2 = augment_batch_images(
             keys1=keys21,
             keys2=keys2,
             images=u2,
             crop_size=crop_size,
-            prob_random_h_flip=args.prob_random_h_flip
+            prob_random_h_flip=cfg.training.prob_random_h_flip
         )
         lx = optax.smooth_labels(
-            labels=jax.nn.one_hot(x=y, num_classes=args.num_classes),
+            labels=jax.nn.one_hot(x=y, num_classes=cfg.dataset.num_classes),
             alpha=0.01
         )
 
@@ -404,12 +315,14 @@ def train(
         logits_u1, _ = state.apply_fn(
             variables={'params': state.params, 'batch_stats': state.batch_stats},
             x=u1,
-            train=True
+            train=True,
+            mutable=['batch_stats']
         )
         logits_u2, _ = state.apply_fn(
             variables={'params': state.params, 'batch_stats': state.batch_stats},
             x=u2,
-            train=True
+            train=True,
+            mutable=['batch_stats']
         )
 
         # average
@@ -418,7 +331,7 @@ def train(
         lu = 0.5 * (lu1 + lu2)
 
         # sharpening
-        lu = lu ** (1 / args.sharpen_factor)
+        lu = lu ** (1 / cfg.training.sharpen_factor)
         lu = lu / jnp.sum(a=lu, axis=-1, keepdims=True)  # normalised
 
         # region MIXUP
@@ -429,7 +342,11 @@ def train(
             key=jax.random.key(seed=random.randint(a=0, b=100_000))
         )
         index = jax.random.permutation(key=index_rng, x=len(inputs))
-        lam = jax.random.beta(key=mixup_ratio_rng, a=args.alpha, b=args.alpha)
+        lam = jax.random.beta(
+            key=mixup_ratio_rng,
+            a=cfg.training.alpha,
+            b=cfg.training.alpha
+        )
         lam = jnp.maximum(lam, 1 - lam)
         mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
         mixed_labels = lam * labels + (1 - lam) * labels[index]
@@ -442,7 +359,7 @@ def train(
             mixed_inputs=mixed_inputs,
             mixed_labels=mixed_labels,
             state=state,
-            lambda_u=args.lambda_u
+            lambda_u=cfg.training.lambda_u
         )
 
         if jnp.isnan(loss):
@@ -454,7 +371,19 @@ def train(
     return state, loss_accum.compute()
 
 
-def evaluate(dataset: dx._c.Buffer,state: TrainState) -> Scalar:
+@jax.jit
+def prediction_step(x: Array, state: TrainState) -> Array:
+    logits, _ = state.apply_fn(
+        variables={'params': state.params, 'batch_stats': state.batch_stats},
+        x=x,
+        train=False,
+        mutable=['batch_stats']
+    )
+    
+    return logits
+
+
+def evaluate(dataset: dx._c.Buffer, state: TrainState, cfg: DictConfig) -> Scalar:
     """calculate the average cluster probability vector
 
     Args:
@@ -465,11 +394,11 @@ def evaluate(dataset: dx._c.Buffer,state: TrainState) -> Scalar:
     dset = prepare_dataset(
         dataset=dataset,
         shuffle=True,
-        batch_size=args.batch_size,
-        prefetch_size=args.prefetch_size,
-        num_threads=args.num_threads,
-        mean=args.mean,
-        std=args.std,
+        batch_size=cfg.training.batch_size,
+        prefetch_size=cfg.training.prefetch_size,
+        num_threads=cfg.training.num_threads,
+        mean=cfg.dataset.mean,
+        std=cfg.dataset.std,
         random_crop_size=None,
         prob_random_h_flip=None
     )
@@ -479,53 +408,54 @@ def evaluate(dataset: dx._c.Buffer,state: TrainState) -> Scalar:
     for samples in tqdm(
         iterable=dset,
         desc='evaluate',
-        total=len(dataset)//args.batch_size,
+        total=len(dataset) // cfg.training.batch_size,
         ncols=80,
         leave=False,
         position=2,
         colour='blue',
-        disable=not args.progress_bar
+        disable=not cfg.training.progress_bar
     ):
         x = jnp.asarray(a=samples['image'], dtype=jnp.float32)  # input samples
         y = jnp.asarray(a=samples['label'], dtype=jnp.int32)  # annotated labels (batch_size, num_experts)
 
-        logits, _ = state.apply_fn(
-            variables={'params': state.params, 'batch_stats': state.batch_stats},
-            x=x,
-            train=False
-        )
+        logits = prediction_step(x=x, state=state)
         accuracy_accum.update(logits=logits, labels=y)
 
     return accuracy_accum.compute()
 
 
-def main() -> None:
+@hydra.main(version_base=None, config_path='.', config_name='conf')
+def main(cfg: DictConfig) -> None:
+    jax.config.update('jax_disable_jit', cfg.jax.disable_jit)
+    jax.config.update('jax_platforms', cfg.jax.platform)
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(cfg.jax.mem)
+
     # region DATA
     dset_train_labelled = get_dataset(
-        dataset_file=args.train_labelled_file,
-        root=args.ds_root,
-        resize=args.resized_shape
+        dataset_file=cfg.dataset.train_labelled_file,
+        root=cfg.dataset.root,
+        resize=cfg.dataset.resized_shape
     )
     dset_train_unlabelled = get_dataset(
-        dataset_file=args.train_unlabelled_file,
-        root=args.ds_root,
-        resize=args.resized_shape
+        dataset_file=cfg.dataset.train_unlabelled_file,
+        root=cfg.dataset.root,
+        resize=cfg.dataset.resized_shape
     )
     dset_test = get_dataset(
-        dataset_file=args.test_file,
-        root=args.ds_root,
-        resize=args.crop_size if args.crop_size is not None else args.resized_shape
+        dataset_file=cfg.dataset.test_file,
+        root=cfg.dataset.root,
+        resize=cfg.dataset.crop_size if cfg.dataset.crop_size is not None else cfg.dataset.resized_shape
     )
     # endregion
     
     # region MODELS
     state = initialise_huggingface_resnet(
-        model=resnet18(num_classes=args.num_classes, dtype=jnp.bfloat16),
+        model=resnet18(num_classes=cfg.dataset.num_classes, dtype=jnp.bfloat16),
         sample=jnp.expand_dims(a=dset_train_labelled[0]['image'] / 255, axis=0),
         num_training_samples=len(dset_train_unlabelled),
-        lr=args.lr,
-        batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
+        lr=cfg.training.lr,
+        batch_size=cfg.training.batch_size,
+        num_epochs=cfg.training.num_epochs,
         key=jax.random.key(seed=random.randint(a=0, b=1_000))
     )
 
@@ -539,28 +469,36 @@ def main() -> None:
     # endregion
 
     # region Mlflow
-    mlflow.set_tracking_uri(uri=args.tracking_uri)
-    mlflow.set_experiment(experiment_name=args.experiment_name)
-    mlflow.set_system_metrics_sampling_interval(interval=600)
-    mlflow.set_system_metrics_samples_before_logging(samples=1)
+    mlflow.set_tracking_uri(uri=cfg.experiment.tracking_uri)
+    mlflow.set_experiment(experiment_name=cfg.experiment.name)
+    mlflow.disable_system_metrics_logging()
 
     # create a directory for storage (if not existed)
-    if not os.path.exists(path=args.logdir):
-        Path(args.logdir).mkdir(parents=True, exist_ok=True)
+    if not os.path.exists(path=cfg.experiment.logdir):
+        Path(cfg.experiment.logdir).mkdir(parents=True, exist_ok=True)
     # endregion
 
     # enable mlflow tracking
-    with mlflow.start_run(run_id=args.run_id, log_system_metrics=True) as mlflow_run:
+    with mlflow.start_run(run_id=cfg.experiment.run_id, log_system_metrics=False) as mlflow_run:
         # append run id into the artifact path
-        ckpt_dir = os.path.join(args.logdir, args.experiment_name, mlflow_run.info.run_id)
+        ckpt_dir = os.path.join(
+            os.getcwd(),
+            cfg.experiment.logdir,
+            cfg.experiment.name,
+            mlflow_run.info.run_id
+        )
 
         # enable an orbax checkpoint manager to save model's parameters
         with ocp.CheckpointManager(directory=ckpt_dir, options=ckpt_options) as ckpt_mngr:
 
-            if args.run_id is None:  # new run
-
+            if cfg.experiment.run_id is None:  # new run
                 # log hyper-parameters
-                mlflow.log_params(params=args.__dict__)
+                mlflow.log_params(
+                    params=flatdict.FlatDict(
+                        value=OmegaConf.to_container(cfg=cfg),
+                        delimiter='.'
+                    )
+                )
 
                 # log source code
                 mlflow.log_artifact(
@@ -583,21 +521,22 @@ def main() -> None:
 
             # training
             for epoch_id in tqdm(
-                iterable=range(start_epoch_id, args.num_epochs, 1),
+                iterable=range(start_epoch_id, cfg.training.num_epochs, 1),
                 desc='progress',
                 ncols=80,
                 leave=True,
                 position=1,
                 colour='green',
-                disable=not args.progress_bar
+                disable=not cfg.training.progress_bar
             ):
                 state, loss = train(
                     dataset_labelled=dset_train_labelled,
                     dataset_unlabelled=dset_train_unlabelled,
-                    state=state
+                    state=state,
+                    cfg=cfg
                 )
 
-                accuracy = evaluate(dataset=dset_test, state=state)
+                accuracy = evaluate(dataset=dset_test, state=state, cfg=cfg)
 
                 # save parameters asynchronously
                 ckpt_mngr.save(
@@ -616,19 +555,11 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    # get the global configuration
-    args = parse_arguments()
-
-    jax.config.update('jax_disable_jit', not args.train)
-    jax.config.update('jax_platforms', args.jax_platform)
-
     # region CACHING to reduce compilation time
-    # jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-    # jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
-    # jax.config.update("jax_persistent_cache_min_compile_time_secs", 120)
+    jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 120)
     # endregion
-
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(args.mem_frac)
 
     os.environ['XLA_FLAGS'] = (
         '--xla_gpu_enable_triton_softmax_fusion=true '
